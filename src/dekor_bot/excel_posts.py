@@ -12,7 +12,11 @@ try:
 except Exception:  # pragma: no cover
     gspread = None  # type: ignore[assignment]
 
-from .excel_meta import _gsheet_worksheet_by_title, _norm_queue_post_id
+from .excel_meta import (
+    _gsheet_worksheet_by_title,
+    _norm_queue_post_id,
+    normalize_google_service_account_json_inline,
+)
 
 
 @dataclass(frozen=True)
@@ -44,25 +48,21 @@ def _extract_gsheet_id(url: str) -> str:
 def _get_gspread_client():
     if gspread is None:
         return None
+    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if creds_path:
+        p = Path(creds_path).expanduser().resolve()
+        if p.is_file():
+            return gspread.service_account(filename=str(p))
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
-    inline_json = raw.strip().lstrip("\ufeff")
+    inline_json = normalize_google_service_account_json_inline(raw)
     if inline_json:
         try:
             info = json.loads(inline_json)
             return gspread.service_account_from_dict(info)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: ошибка JSON — {exc.msg} (позиция {exc.pos}). "
-                "Одна строка в .env; в private_key только \\n; не ставьте # в конце строки с JSON."
-            ) from exc
-        except Exception as exc:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: невалидные данные.") from exc
-    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if creds_path:
-        p = Path(creds_path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"Файл service account не найден: {p}")
-        return gspread.service_account(filename=str(p))
+        except (json.JSONDecodeError, ValueError):
+            return None
+        except Exception:
+            return None
     return None
 
 

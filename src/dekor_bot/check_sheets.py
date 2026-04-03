@@ -21,6 +21,14 @@ def _service_account_email() -> str | None:
 
     from .excel_meta import normalize_google_service_account_json_inline
 
+    path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if path:
+        p = Path(path).expanduser()
+        if p.is_file():
+            try:
+                return str(json.loads(p.read_text(encoding="utf-8")).get("client_email") or "").strip() or None
+            except (OSError, json.JSONDecodeError):
+                pass
     raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
     inline = normalize_google_service_account_json_inline(raw)
     if inline:
@@ -28,16 +36,7 @@ def _service_account_email() -> str | None:
             return str(json.loads(inline).get("client_email") or "").strip() or None
         except json.JSONDecodeError:
             return None
-    path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if not path:
-        return None
-    p = Path(path).expanduser()
-    if not p.is_file():
-        return None
-    try:
-        return str(json.loads(p.read_text(encoding="utf-8")).get("client_email") or "").strip() or None
-    except (OSError, json.JSONDecodeError):
-        return None
+    return None
 
 
 def main() -> int:
@@ -80,19 +79,29 @@ def main() -> int:
     email = _service_account_email()
     inline_raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE") or "").strip()
     json_path = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
+    json_file = Path(json_path).expanduser() if json_path else None
+
     if email:
         print(f"Сервис-аккаунт (добавьте его в «Поделиться» таблицы как редактор): {email}")
-    elif inline_raw:
+    elif json_path and json_file and json_file.is_file():
         print(
-            "GOOGLE_SERVICE_ACCOUNT_JSON_INLINE задан, но из него не получается прочитать client_email (битый JSON).\n"
-            "  Уберите внешние кавычки вокруг всего JSON, одна строка, без # в конце.\n"
-            "  Надёжнее: GOOGLE_SERVICE_ACCOUNT_JSON=/opt/dekor_autoposting/sa.json",
+            f"Файл {json_path} есть, но это не валидный JSON сервис-аккаунта (или нет client_email). Перезапишите файл из Google.",
             file=sys.stderr,
         )
-    elif not json_path:
+    elif json_path and json_file and not json_file.is_file():
         print(
-            "В .env нет GOOGLE_SERVICE_ACCOUNT_JSON и не задан разборчивый GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.\n"
-            "  Добавьте файл ключа: GOOGLE_SERVICE_ACCOUNT_JSON=/полный/путь/к.json",
+            f"В .env задан GOOGLE_SERVICE_ACCOUNT_JSON={json_path}, но файла нет. Создайте его или поправьте путь.",
+            file=sys.stderr,
+        )
+    elif inline_raw:
+        print(
+            "Битый GOOGLE_SERVICE_ACCOUNT_JSON_INLINE и не задан рабочий GOOGLE_SERVICE_ACCOUNT_JSON (файл).\n"
+            "  В .env добавьте строку: GOOGLE_SERVICE_ACCOUNT_JSON=/opt/dekor_autoposting/sa.json",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "Не заданы GOOGLE_SERVICE_ACCOUNT_JSON и GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.",
             file=sys.stderr,
         )
 

@@ -92,6 +92,14 @@ def normalize_google_service_account_json_inline(raw: str) -> str:
 def _get_gspread_client():
     if gspread is None:
         raise RuntimeError("Для Google Sheets установите зависимости: gspread и google-auth.")
+    # Файл надёжнее длинного INLINE; если путь задан и файл есть — используем его (даже если INLINE в .env ещё битый).
+    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if creds_path:
+        p = Path(creds_path).expanduser().resolve()
+        if p.is_file():
+            return gspread.service_account(filename=str(p))
+        raise FileNotFoundError(f"Файл service account не найден: {p}")
+
     raw_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
     inline_json = normalize_google_service_account_json_inline(raw_inline)
     if inline_json:
@@ -125,13 +133,7 @@ def _get_gspread_client():
             raise ValueError(
                 "GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: не удалось разобрать ключ. Проверьте однострочный JSON или используйте файл GOOGLE_SERVICE_ACCOUNT_JSON=..."
             ) from exc
-    creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
-    if creds_path:
-        p = Path(creds_path).expanduser().resolve()
-        if not p.exists():
-            raise FileNotFoundError(f"Файл service account не найден: {p}")
-        return gspread.service_account(filename=str(p))
-    raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.")
+    raise RuntimeError("Не задан GOOGLE_SERVICE_ACCOUNT_JSON (файл) или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.")
 
 
 def _open_gsheet(source: str | Path):
