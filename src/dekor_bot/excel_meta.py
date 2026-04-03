@@ -78,6 +78,16 @@ def _open_gsheet(source: str | Path):
     return _get_gspread_client().open_by_key(sid)
 
 
+def _gsheet_worksheet_by_title(spreadsheet, title: str):
+    """Имя листа в UI может отличаться регистром — gspread ищет только точное совпадение."""
+    want = _norm(title)
+    for ws in spreadsheet.worksheets():
+        if _norm(ws.title) == want:
+            return ws
+    names = [ws.title for ws in spreadsheet.worksheets()]
+    raise ValueError(f"Лист «{title}» не найден в таблице. Доступные листы: {names}")
+
+
 def _worksheet_to_df(ws) -> pd.DataFrame:
     values = ws.get_all_values()
     if not values:
@@ -90,7 +100,8 @@ def _worksheet_to_df(ws) -> pd.DataFrame:
 def _sheet_exists(xlsx_path: str | Path, sheet_name: str) -> bool:
     if _is_google_sheets_url(xlsx_path):
         try:
-            _open_gsheet(xlsx_path).worksheet(sheet_name)
+            sh = _open_gsheet(xlsx_path)
+            _gsheet_worksheet_by_title(sh, sheet_name)
             return True
         except Exception:
             return False
@@ -111,7 +122,8 @@ def _pick_sheet_name(xlsx_path: str | Path, desired: str) -> str:
 
 def _read_kv_sheet(xlsx_path: str | Path, sheet_name: str) -> dict[str, str]:
     if _is_google_sheets_url(xlsx_path):
-        ws = _open_gsheet(xlsx_path).worksheet(sheet_name)
+        sh = _open_gsheet(xlsx_path)
+        ws = _gsheet_worksheet_by_title(sh, sheet_name)
         df = _worksheet_to_df(ws)
         sheet = sheet_name
     else:
@@ -221,7 +233,8 @@ def read_frequency_days(xlsx_path: str | Path) -> int | None:
     if not _sheet_exists(xlsx_path, "Frequency"):
         return None
     if _is_google_sheets_url(xlsx_path):
-        df = _worksheet_to_df(_open_gsheet(xlsx_path).worksheet("Frequency"))
+        sh = _open_gsheet(xlsx_path)
+        df = _worksheet_to_df(_gsheet_worksheet_by_title(sh, "Frequency"))
     else:
         sheet = _pick_sheet_name(xlsx_path, "Frequency")
         df = pd.read_excel(Path(xlsx_path), sheet_name=sheet)
@@ -277,7 +290,8 @@ def read_frequency_days(xlsx_path: str | Path) -> int | None:
 
 def read_queue_post_ids(xlsx_path: str | Path) -> list[str]:
     if _is_google_sheets_url(xlsx_path):
-        df = _worksheet_to_df(_open_gsheet(xlsx_path).worksheet("Queue"))
+        sh = _open_gsheet(xlsx_path)
+        df = _worksheet_to_df(_gsheet_worksheet_by_title(sh, "Queue"))
     else:
         sheet = _pick_sheet_name(xlsx_path, "Queue")
         df = pd.read_excel(Path(xlsx_path), sheet_name=sheet)
@@ -306,7 +320,8 @@ def read_state(xlsx_path: str | Path) -> ExcelState:
 
 def write_state(xlsx_path: str | Path, *, post_index: int, last_posted_at: datetime | None) -> None:
     if _is_google_sheets_url(xlsx_path):
-        ws = _open_gsheet(xlsx_path).worksheet("State")
+        sh = _open_gsheet(xlsx_path)
+        ws = _gsheet_worksheet_by_title(sh, "State")
         rows = ws.get_all_values()
         if not rows:
             ws.update("A1:B1", [["Key", "Value"]])

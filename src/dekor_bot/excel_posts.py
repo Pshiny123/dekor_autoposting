@@ -12,7 +12,7 @@ try:
 except Exception:  # pragma: no cover
     gspread = None  # type: ignore[assignment]
 
-from .excel_meta import _norm_queue_post_id
+from .excel_meta import _gsheet_worksheet_by_title, _norm_queue_post_id
 
 
 @dataclass(frozen=True)
@@ -65,7 +65,8 @@ def _read_gsheet_df(url: str, sheet_name: str) -> pd.DataFrame | None:
     client = _get_gspread_client()
     if client is not None:
         try:
-            ws = client.open_by_key(sid).worksheet(sheet_name)
+            sh = client.open_by_key(sid)
+            ws = _gsheet_worksheet_by_title(sh, sheet_name)
             values = ws.get_all_values()
             if not values:
                 return pd.DataFrame()

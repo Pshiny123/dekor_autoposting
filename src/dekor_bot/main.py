@@ -194,7 +194,8 @@ def main() -> None:
     if not token:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN (создайте .env по примеру .env.example).")
 
-    posts_source = os.getenv("POSTS_XLSX_PATH", "posts.xlsx").strip()
+    posts_source_raw = os.getenv("POSTS_XLSX_PATH", "posts.xlsx").strip()
+    posts_source = posts_source_raw
     if not _is_google_sheets_url(posts_source):
         posts_source = str(Path(posts_source).resolve())
     sheet_name = os.getenv("POSTS_SHEET_NAME", "posts").strip()
@@ -210,6 +211,12 @@ def main() -> None:
     tg = TelegramClient(token=token)
 
     use_excel_meta = has_meta_sheets(posts_source)
+    if _is_google_sheets_url(posts_source_raw) and not use_excel_meta:
+        logger.warning(
+            "POSTS_XLSX_PATH — Google Sheets, но State/Queue/Settings не открываются через API "
+            "(проверьте GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE в .env и доступ к таблице). "
+            "Посты могут грузиться с публичного CSV; счётчик очереди — из state.json."
+        )
     if use_excel_meta:
         freq = read_frequency_days(posts_source)
         if freq is not None:

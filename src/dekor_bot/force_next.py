@@ -44,7 +44,8 @@ def main() -> None:
     if not token:
         raise SystemExit("Не задан TELEGRAM_BOT_TOKEN (создайте .env по примеру .env.example).")
 
-    posts_source = os.getenv("POSTS_XLSX_PATH", "posts.xlsx").strip()
+    posts_source_raw = os.getenv("POSTS_XLSX_PATH", "posts.xlsx").strip()
+    posts_source = posts_source_raw
     if not _is_google_sheets_url(posts_source):
         posts_source = str(Path(posts_source).resolve())
     sheet_name = os.getenv("POSTS_SHEET_NAME", "posts").strip()
@@ -55,6 +56,13 @@ def main() -> None:
     tg = TelegramClient(token=token)
 
     use_excel_meta = has_meta_sheets(posts_source)
+    if _is_google_sheets_url(posts_source_raw) and not use_excel_meta:
+        logger.warning(
+            "POSTS_XLSX_PATH указывает на Google Sheets, но листы State / Queue / Settings не доступны через API. "
+            "Обычно: нет GOOGLE_SERVICE_ACCOUNT_JSON(_INLINE) в .env на сервере или таблица не расшарена на email "
+            "сервис-аккаунта. Лист Posts может читаться через публичный CSV, а очередь и счётчик — из state.json, "
+            "не из таблицы."
+        )
     if not chat_id and use_excel_meta:
         chat_id = read_settings_chat_id(posts_source)
     if not chat_id:
@@ -112,10 +120,10 @@ def main() -> None:
         new_state.save(state_path)
         logger.info("force_next: state.json — следующий индекс=%s.", new_state.index)
 
-    # Обновляем таймер в state.json так, будто интервал уже наступил сейчас
+    # Таймер следующего окна по-прежнему в state.json (last_posted_at), даже при Google Sheets.
     forced_state = BotState(index=time_state.index, last_posted_at=now)
     forced_state.save(state_path)
-    logger.info("force_next: готово.")
+    logger.info("force_next: state.json обновлён (last_posted_at для интервала). Готово.")
 
 
 if __name__ == "__main__":
