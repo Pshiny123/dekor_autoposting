@@ -122,7 +122,10 @@ def main() -> int:
         print("OK: бот может читать/писать State и очередь через эту таблицу.")
         return 0
 
-    print("Meta-листы недоступны — бот будет опираться на state.json для счётчика очереди.", file=sys.stderr)
+    print(
+        "Meta-листы недоступны — бот не запустится без листов State, Queue, Settings (см. python -m src.dekor_bot.main).",
+        file=sys.stderr,
+    )
     return 2
 
 

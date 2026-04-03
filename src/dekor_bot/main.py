@@ -23,7 +23,6 @@ from .excel_meta import (
     write_state,
 )
 from .excel_posts import Post, index_posts_by_id, load_posts
-from .state import BotState
 from .telegram_api import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -80,7 +79,7 @@ def _parse_post_time_msk(v: str) -> Tuple[int, int]:
 def _next_post_at_utc_from_last(last_posted_at_utc: datetime, interval_days: int, post_hour: int, post_minute: int) -> datetime:
     """
     Следующий пост всегда в заданное локальное время МСК.
-    Интервал применяем к ДАТЕ (в МСК), а не к моменту отправки.
+    Интервал применяем к дате (в МСК), а не к моменту отправки.
     """
     last_msk = last_posted_at_utc.astimezone(_MSK_TZ)
     next_date_msk = last_msk.date() + timedelta(days=interval_days)
@@ -185,6 +184,22 @@ def _send_post(
     logger.info("Отправлено в Telegram (медиа по одному%s).", ", дубль текста" if text and not caption_used else "")
 
 
+def _require_meta_sheets(posts_source: str, posts_source_raw: str) -> None:
+    if has_meta_sheets(posts_source):
+        return
+    hint_gs = ""
+    if _is_google_sheets_url(posts_source_raw):
+        hint_gs = (
+            " Для Google Sheets: задайте GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE, "
+            "расшарьте таблицу на email сервис-аккаунта (редактор)."
+        )
+    raise SystemExit(
+        "В книге (POSTS_XLSX_PATH) обязательны листы State, Queue и Settings. "
+        "Счётчик и время последней публикации хранятся только в листе State (Postindex, LastPostedAt)."
+        + hint_gs
+    )
+
+
 def main() -> None:
     load_dotenv()
     setup_logging()
@@ -204,32 +219,24 @@ def main() -> None:
     post_hour, post_minute = _parse_post_time_msk(post_time_msk)
     start_immediately = _env_bool("START_IMMEDIATELY", True)
     run_once = _env_bool("RUN_ONCE", False)
-    state_path = Path(os.getenv("STATE_PATH", "state.json")).resolve()
 
     posts = load_posts(source=posts_source, sheet_name=sheet_name)
     posts_by_id = index_posts_by_id(posts)
     tg = TelegramClient(token=token)
 
-    use_excel_meta = has_meta_sheets(posts_source)
-    if _is_google_sheets_url(posts_source_raw) and not use_excel_meta:
-        logger.warning(
-            "POSTS_XLSX_PATH — Google Sheets, но State/Queue/Settings не открываются через API "
-            "(проверьте GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE в .env и доступ к таблице). "
-            "Посты могут грузиться с публичного CSV; счётчик очереди — из state.json."
-        )
-    if use_excel_meta:
-        freq = read_frequency_days(posts_source)
-        if freq is not None:
-            interval_days = int(freq)
-    if not chat_id and use_excel_meta:
+    _require_meta_sheets(posts_source, posts_source_raw)
+
+    freq = read_frequency_days(posts_source)
+    if freq is not None:
+        interval_days = int(freq)
+    if not chat_id:
         chat_id = read_settings_chat_id(posts_source)
     if not chat_id:
-        raise SystemExit("Не задан TELEGRAM_CHAT_ID и не найден Settings/chat_id в Excel.")
+        raise SystemExit("Не задан TELEGRAM_CHAT_ID и не найден chat_id в листе Settings.")
 
     logger.info(
-        "Старт: источник=%s, meta_sheets=%s, интервал=%s дн., время МСК=%02d:%02d, RUN_ONCE=%s, START_IMMEDIATELY=%s",
+        "Старт: источник=%s, прогресс в листе State, интервал=%s дн., время МСК=%02d:%02d, RUN_ONCE=%s, START_IMMEDIATELY=%s",
         posts_source if len(str(posts_source)) < 80 else str(posts_source)[:77] + "…",
-        use_excel_meta,
         interval_days,
         post_hour,
         post_minute,
@@ -238,61 +245,39 @@ def main() -> None:
     )
 
     while True:
-        # Время/интервал держим в state.json (чтобы не ломать Excel),
-        # а очередность берём из Excel (State/Queue), если они есть.
-        time_state = BotState.load(state_path)
-        excel_last_posted_at: datetime | None = None
+        q = read_queue_post_ids(posts_source)
+        s = read_state(posts_source)
+        excel_last_posted_at = s.last_posted_at
+        step = ((s.post_index - 1) % len(q)) + 1  # 1..len(q)
+        post_id = q[step - 1]
+        post = posts_by_id.get(str(post_id))
+        if post is None:
+            if str(post_id).strip().casefold() == "recycle":
+                logger.info("Queue: recycle — сброс Postindex на 1.")
+                write_state(posts_source, post_index=1, last_posted_at=_utc_now())
+                continue
+            raise SystemExit(f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts.")
 
-        if use_excel_meta:
-            q = read_queue_post_ids(posts_source)
-            s = read_state(posts_source)
-            excel_last_posted_at = s.last_posted_at
-            step = ((s.post_index - 1) % len(q)) + 1  # 1..len(q)
-            post_id = q[step - 1]
-            post = posts_by_id.get(str(post_id))
-            if post is None:
-                # В вашем файле Queue заканчивается маркером "recycle" — это означает "вернуться к началу".
-                if str(post_id).strip().casefold() == "recycle":
-                    logger.info("Queue: recycle — сброс Postindex на 1.")
-                    write_state(posts_source, post_index=1, last_posted_at=_utc_now())
-                    continue
-                raise SystemExit(f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts.")
-        else:
-            idx = time_state.index % len(posts)
-            post = posts[idx]
-
-        # Если в Excel хранится время последней публикации, используем его как источник истины.
-        effective_last_posted_at = excel_last_posted_at if excel_last_posted_at is not None else time_state.last_posted_at
+        effective_last_posted_at = excel_last_posted_at
         if effective_last_posted_at is None:
             if start_immediately:
-                if use_excel_meta:
-                    _send_post(
-                        tg,
-                        chat_id,
-                        post,
-                        queue_step=step,
-                        queue_len=len(q),
-                        excel_post_index=s.post_index,
-                    )
-                    q = read_queue_post_ids(posts_source)
-                    s = read_state(posts_source)
-                    next_step = (s.post_index % len(q)) + 1
-                    write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
-                    logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
-                else:
-                    _send_post(tg, chat_id, post)
-                    # индекс в json используем только если нет Excel очереди
-                    new_state = BotState(index=(time_state.index + 1) % len(posts), last_posted_at=_utc_now())
-                    new_state.save(state_path)
-                    logger.info("state.json: следующий индекс поста=%s.", new_state.index)
-
-                new_time_state = BotState(index=time_state.index, last_posted_at=_utc_now())
-                new_time_state.save(state_path)
+                _send_post(
+                    tg,
+                    chat_id,
+                    post,
+                    queue_step=step,
+                    queue_len=len(q),
+                    excel_post_index=s.post_index,
+                )
+                q = read_queue_post_ids(posts_source)
+                s = read_state(posts_source)
+                next_step = (s.post_index % len(q)) + 1
+                write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+                logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
                 if run_once:
                     logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
                     return
                 continue
-            # Первый запуск: если не стартуем сразу — ждём ближайшие постовые часы в МСК.
             now_msk = _utc_now().astimezone(_MSK_TZ)
             today_target = datetime(
                 now_msk.year,
@@ -332,31 +317,20 @@ def main() -> None:
             time.sleep(min(sleep_s, 60))
             continue
 
-        if use_excel_meta:
-            _send_post(
-                tg,
-                chat_id,
-                post,
-                queue_step=step,
-                queue_len=len(q),
-                excel_post_index=s.post_index,
-            )
-        else:
-            _send_post(tg, chat_id, post)
+        _send_post(
+            tg,
+            chat_id,
+            post,
+            queue_step=step,
+            queue_len=len(q),
+            excel_post_index=s.post_index,
+        )
 
-        if use_excel_meta:
-            q = read_queue_post_ids(posts_source)
-            s = read_state(posts_source)
-            next_step = (s.post_index % len(q)) + 1
-            write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
-            logger.info("State обновлён: Postindex=%s.", next_step)
-        else:
-            new_state = BotState(index=(time_state.index + 1) % len(posts), last_posted_at=_utc_now())
-            new_state.save(state_path)
-            logger.info("state.json: следующий индекс поста=%s.", new_state.index)
-
-        new_time_state = BotState(index=time_state.index, last_posted_at=_utc_now())
-        new_time_state.save(state_path)
+        q = read_queue_post_ids(posts_source)
+        s = read_state(posts_source)
+        next_step = (s.post_index % len(q)) + 1
+        write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+        logger.info("State обновлён: Postindex=%s.", next_step)
         if run_once:
             logger.info("RUN_ONCE: цикл завершён после публикации.")
             return
@@ -364,4 +338,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
