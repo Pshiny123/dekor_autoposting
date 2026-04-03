@@ -131,6 +131,47 @@ def _dt_from_iso(s: str) -> datetime:
     return dt.astimezone(timezone.utc)
 
 
+def _parse_post_index_value(raw: str) -> int:
+    """
+    Google Sheets / pandas часто дают число как строку '34.0'.
+    int('34.0') падает — из-за этого раньше индекс сбрасывался на 1 и постился только первый пост.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return 1
+    try:
+        x = float(s.replace(",", "."))
+        if x < 1:
+            return 1
+        return max(1, int(x))
+    except ValueError:
+        return 1
+
+
+def _norm_queue_post_id(v: object) -> str | None:
+    """PostID из таблицы: 5 и 5.0 -> строка '5' для совпадения с колонкой ID в Posts."""
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v == int(v):
+            return str(int(v))
+        return str(v).strip()
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        xf = float(s.replace(",", "."))
+        if xf == int(xf):
+            return str(int(xf))
+    except ValueError:
+        pass
+    return s
+
+
 @dataclass(frozen=True)
 class ExcelState:
     # 1-based индекс шага в Queue
@@ -224,9 +265,7 @@ def read_queue_post_ids(xlsx_path: str | Path) -> list[str]:
     post_ids: list[str] = []
     for _, row in df.iterrows():
         v = row.get("PostID")
-        if v is None or pd.isna(v):
-            continue
-        s = str(v).strip()
+        s = _norm_queue_post_id(v)
         if s:
             post_ids.append(s)
     if not post_ids:
@@ -237,12 +276,7 @@ def read_queue_post_ids(xlsx_path: str | Path) -> list[str]:
 def read_state(xlsx_path: str | Path) -> ExcelState:
     kv = _read_kv_sheet(xlsx_path, "State")
     raw = kv.get("Postindex", "") or kv.get("PostIndex", "") or kv.get("postindex", "")
-    try:
-        post_index = int(str(raw).strip())
-    except Exception:
-        post_index = 1
-    if post_index < 1:
-        post_index = 1
+    post_index = _parse_post_index_value(str(raw))
 
     last_raw = kv.get("LastPostedAt", "").strip()
     last_dt = _dt_from_iso(last_raw) if last_raw else None
