@@ -54,24 +54,62 @@ def _extract_gsheet_id(url: str) -> str:
         raise ValueError("Не удалось извлечь spreadsheet id из Google Sheets URL.") from exc
 
 
+def normalize_google_service_account_json_inline(raw: str) -> str:
+    """
+    Готовит значение из .env к json.loads.
+
+    Частые поломки: обёртка '...' или \"...\" вокруг всего JSON, BOM, мусор до первого «{».
+    Ошибка «Expecting property name… (позиция 1)» часто из‑за «умных» кавычек (Word/Docs) вместо ".
+    """
+    s = (raw or "").strip().lstrip("\ufeff").replace("\x00", "")
+    for bad, good in (
+        ("\u201c", '"'),
+        ("\u201d", '"'),
+        ("\u00ab", '"'),
+        ("\u00bb", '"'),
+        ("\u2033", '"'),
+        ("\uff02", '"'),
+    ):
+        s = s.replace(bad, good)
+    if not s:
+        return ""
+    for _ in range(4):
+        t = s.strip()
+        if len(t) >= 2 and t[0] == t[-1] and t[0] in "'\"":
+            inner = t[1:-1].strip().lstrip("\ufeff")
+            if inner.startswith("{") and inner.endswith("}"):
+                s = inner
+                continue
+        break
+    if not s.startswith("{"):
+        i = s.find("{")
+        j = s.rfind("}")
+        if i != -1 and j != -1 and j > i:
+            s = s[i : j + 1].strip()
+    return s
+
+
 def _get_gspread_client():
     if gspread is None:
         raise RuntimeError("Для Google Sheets установите зависимости: gspread и google-auth.")
     raw_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
-    inline_json = raw_inline.strip().lstrip("\ufeff")
+    inline_json = normalize_google_service_account_json_inline(raw_inline)
     if inline_json:
         try:
             info = json.loads(inline_json)
             return gspread.service_account_from_dict(info)
         except json.JSONDecodeError as exc:
+            head = (inline_json[:36] + ("…" if len(inline_json) > 36 else "")).replace("\n", "\\n")
+            ords = [ord(c) for c in inline_json[:8]] if inline_json else []
             hint = (
-                "Частые причины: (1) JSON в .env разбит на несколько строк — должна быть РОВНО одна строка, "
-                "в private_key только \\n как два символа; (2) в строке есть неэкранированные кавычки; "
-                "(3) после значения на той же строке идёт # комментарий — обрежет JSON. "
-                "Надёжнее: сохраните ключ в .json файл и задайте GOOGLE_SERVICE_ACCOUNT_JSON=/полный/путь/к/ключу.json"
+                "Частые причины: (1) вся строка INLINE в двойных кавычках в .env без экранирования внутренних \"; "
+                "(2) обрезка строки (# в конце, перенос на новую строку в середине JSON); "
+                "(3) кавычки скопированы из Word/Google Docs. "
+                "Надёжнее: GOOGLE_SERVICE_ACCOUNT_JSON=/opt/dekor_autoposting/sa.json (файл UTF-8, как скачал Google)."
             )
             raise ValueError(
-                f"GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: ошибка JSON — {exc.msg} (позиция {exc.pos}). {hint}"
+                f"GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: ошибка JSON — {exc.msg} (позиция/символ {exc.pos}). "
+                f"Диагностика начала: {head!r}, ord() первых символов: {ords}. {hint}"
             ) from exc
         except Exception as exc:
             raise ValueError(

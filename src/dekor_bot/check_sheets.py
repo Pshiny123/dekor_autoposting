@@ -19,7 +19,10 @@ from dotenv import load_dotenv
 def _service_account_email() -> str | None:
     import os
 
-    inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "").strip()
+    from .excel_meta import normalize_google_service_account_json_inline
+
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
+    inline = normalize_google_service_account_json_inline(raw)
     if inline:
         try:
             return str(json.loads(inline).get("client_email") or "").strip() or None
@@ -60,6 +63,7 @@ def main() -> int:
         _is_google_sheets_url,
         _norm,
         has_meta_sheets,
+        normalize_google_service_account_json_inline,
         read_queue_post_ids,
         read_state,
     )
@@ -74,14 +78,21 @@ def main() -> int:
         return 0
 
     email = _service_account_email()
+    inline_raw = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE") or "").strip()
+    json_path = (os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or "").strip()
     if email:
         print(f"Сервис-аккаунт (добавьте его в «Поделиться» таблицы как редактор): {email}")
-    else:
+    elif inline_raw:
         print(
-            "В .env нет ключа Google для сервис-аккаунта.\n"
-            "  Добавьте GOOGLE_SERVICE_ACCOUNT_JSON_INLINE=... (JSON одной строкой)\n"
-            "  или GOOGLE_SERVICE_ACCOUNT_JSON=/путь/к/ключ.json\n"
-            "Скопируйте те же переменные, что на машине, где у вас уже менялся State.",
+            "GOOGLE_SERVICE_ACCOUNT_JSON_INLINE задан, но из него не получается прочитать client_email (битый JSON).\n"
+            "  Уберите внешние кавычки вокруг всего JSON, одна строка, без # в конце.\n"
+            "  Надёжнее: GOOGLE_SERVICE_ACCOUNT_JSON=/opt/dekor_autoposting/sa.json",
+            file=sys.stderr,
+        )
+    elif not json_path:
+        print(
+            "В .env нет GOOGLE_SERVICE_ACCOUNT_JSON и не задан разборчивый GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.\n"
+            "  Добавьте файл ключа: GOOGLE_SERVICE_ACCOUNT_JSON=/полный/путь/к.json",
             file=sys.stderr,
         )
 
@@ -89,8 +100,15 @@ def main() -> int:
         client = _get_gspread_client()
     except Exception as exc:
         print(f"Ошибка учётных данных Google: {exc}", file=sys.stderr)
-        if not email:
-            print("(Сначала задайте JSON сервис-аккаунта в .env — см. выше.)", file=sys.stderr)
+        if inline_raw:
+            n = normalize_google_service_account_json_inline(inline_raw)
+            print(
+                f"Подсказка: длина значения INLINE после нормализации — {len(n)} симв.; "
+                "если <<300, строка в .env, скорее всего, обрезана (или лишние внешние кавычки).",
+                file=sys.stderr,
+            )
+        if not email and not inline_raw and not json_path:
+            print("(Задайте корректный JSON сервис-аккаунта — см. выше.)", file=sys.stderr)
         return 1
 
     sid = _extract_gsheet_id(raw)
