@@ -16,7 +16,28 @@ except Exception:  # pragma: no cover
 
 
 def _norm(s: str) -> str:
-    return s.strip().casefold()
+    return str(s).strip().lstrip("\ufeff").strip().casefold()
+
+
+def _kv_key_loose(s: str) -> str:
+    """Ключ без регистра, BOM, пробелов и подчёркиваний — чтобы сработало и «Post index»."""
+    return _norm(s).replace(" ", "").replace("_", "")
+
+
+def _kv_lookup_ci(kv: dict[str, str], *keyword_norms: str) -> str:
+    """
+    Ищем значение по Key/Value листу без учёта регистра и пробелов в имени ключа.
+    """
+    norm_to_val: dict[str, str] = {}
+    for k, v in kv.items():
+        nk = _kv_key_loose(k)
+        if nk:
+            norm_to_val[nk] = "" if v is None else str(v).strip()
+    for want in keyword_norms:
+        w = _kv_key_loose(want)
+        if w in norm_to_val:
+            return norm_to_val[w]
+    return ""
 
 
 def _is_google_sheets_url(source: str | Path) -> bool:
@@ -104,7 +125,7 @@ def _read_kv_sheet(xlsx_path: str | Path, sheet_name: str) -> dict[str, str]:
         v = row.get("Value")
         if k is None or pd.isna(k):
             continue
-        key = str(k).strip()
+        key = str(k).strip().lstrip("\ufeff").strip()
         if not key:
             continue
         if v is None or pd.isna(v):
@@ -275,10 +296,10 @@ def read_queue_post_ids(xlsx_path: str | Path) -> list[str]:
 
 def read_state(xlsx_path: str | Path) -> ExcelState:
     kv = _read_kv_sheet(xlsx_path, "State")
-    raw = kv.get("Postindex", "") or kv.get("PostIndex", "") or kv.get("postindex", "")
+    raw = _kv_lookup_ci(kv, "Postindex", "PostIndex", "post_index", "step", "Step")
     post_index = _parse_post_index_value(str(raw))
 
-    last_raw = kv.get("LastPostedAt", "").strip()
+    last_raw = _kv_lookup_ci(kv, "LastPostedAt", "LastPosted", "last_posted_at").strip()
     last_dt = _dt_from_iso(last_raw) if last_raw else None
     return ExcelState(post_index=post_index, last_posted_at=last_dt)
 
@@ -296,11 +317,15 @@ def write_state(xlsx_path: str | Path, *, post_index: int, last_posted_at: datet
         if key_col is None or value_col is None:
             raise ValueError("Лист State должен иметь заголовки Key и Value в первой строке.")
 
+        def row_key_matches(cell_val: str, key: str) -> bool:
+            a, b = str(cell_val), str(key)
+            return _norm(a) == _norm(b) or _kv_key_loose(a) == _kv_key_loose(b)
+
         def upsert(key: str, value: str) -> None:
             cur_rows = ws.get_all_values()
             for r_idx, row in enumerate(cur_rows[1:], start=2):
                 cur = row[key_col - 1] if len(row) >= key_col else ""
-                if _norm(str(cur)) == _norm(key):
+                if row_key_matches(cur, key):
                     ws.update_cell(r_idx, value_col, value)
                     return
             width = max(len(cur_rows[0]), value_col)
@@ -331,13 +356,19 @@ def write_state(xlsx_path: str | Path, *, post_index: int, last_posted_at: datet
     if key_col is None or value_col is None:
         raise ValueError("Лист State должен иметь заголовки Key и Value в первой строке.")
 
+    def row_key_matches_cell(k: object, key: str) -> bool:
+        if k is None:
+            return False
+        a = str(k).strip()
+        return _norm(a) == _norm(key) or _kv_key_loose(a) == _kv_key_loose(key)
+
     def upsert(key: str, value: str) -> None:
         for r in range(2, ws.max_row + 1):
             k = ws.cell(row=r, column=key_col).value
-            if isinstance(k, str) and _norm(k) == _norm(key):
+            if isinstance(k, str) and row_key_matches_cell(k, key):
                 ws.cell(row=r, column=value_col).value = value
                 return
-            if k is not None and not isinstance(k, str) and str(k).strip() and _norm(str(k)) == _norm(key):
+            if k is not None and not isinstance(k, str) and str(k).strip() and row_key_matches_cell(k, key):
                 ws.cell(row=r, column=value_col).value = value
                 return
         r = ws.max_row + 1

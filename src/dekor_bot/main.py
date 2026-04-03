@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,6 +25,22 @@ from .excel_meta import (
 from .excel_posts import Post, index_posts_by_id, load_posts
 from .state import BotState
 from .telegram_api import TelegramClient
+
+logger = logging.getLogger(__name__)
+
+
+def setup_logging() -> None:
+    """Вызвать один раз при старте CLI (main / force_next). Уровень: LOG_LEVEL или INFO."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    level_name = (os.getenv("LOG_LEVEL") or "INFO").strip().upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 
 
 def _is_google_sheets_url(source: str) -> bool:
@@ -92,18 +109,55 @@ def _all_urls(items: list[str]) -> bool:
     return True
 
 
-def _send_post(tg: TelegramClient, chat_id: str, post: Post) -> None:
+def _preview_text(text: str, max_len: int = 120) -> str:
+    one = " ".join(text.split())
+    if len(one) <= max_len:
+        return one
+    return one[: max_len - 1] + "…"
+
+
+def _send_post(
+    tg: TelegramClient,
+    chat_id: str,
+    post: Post,
+    *,
+    queue_step: int | None = None,
+    queue_len: int | None = None,
+    excel_post_index: int | None = None,
+) -> None:
     text = (post.text or "").strip()
     photos = post.photos
     videos = post.videos
 
+    extra = ""
+    if queue_step is not None and queue_len is not None:
+        extra += f", шаг очереди {queue_step}/{queue_len}"
+    if excel_post_index is not None:
+        extra += f", State.post_index={excel_post_index}"
+
     if not photos and not videos:
         if not text:
+            logger.warning("Пост id=%s пропущен: нет текста и медиа%s", post.post_id, extra)
             return
+        logger.info("Отправка: id=%s, chat=%s, только текст (%s симв.)%s", post.post_id, chat_id, len(text), extra)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Текст: %s", _preview_text(text))
         tg.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+        logger.info("Отправлено в Telegram (сообщение).")
         return
 
     media_items = [{"type": "photo", "media": p} for p in photos] + [{"type": "video", "media": v} for v in videos]
+    logger.info(
+        "Отправка: id=%s, chat=%s, фото=%s видео=%s, альбом=%s%s",
+        post.post_id,
+        chat_id,
+        len(photos),
+        len(videos),
+        len(media_items) <= 10 and _all_urls([m["media"] for m in media_items]),
+        extra,
+    )
+    if text and logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Подпись: %s", _preview_text(text))
 
     # Если все медиа — URL и <=10 штук, то отправляем альбомом (caption только у первого).
     if len(media_items) <= 10 and _all_urls([m["media"] for m in media_items]):
@@ -111,6 +165,7 @@ def _send_post(tg: TelegramClient, chat_id: str, post: Post) -> None:
             media_items[0]["caption"] = text
             media_items[0]["parse_mode"] = "HTML"
         tg.send_media_group(chat_id=chat_id, media=media_items)
+        logger.info("Отправлено в Telegram (медиагруппа).")
         return
 
     # Иначе отправляем по одному (чтобы поддержать локальные файлы тоже).
@@ -127,10 +182,12 @@ def _send_post(tg: TelegramClient, chat_id: str, post: Post) -> None:
     # в конце продублируем текст отдельным сообщением.
     if text and not caption_used:
         tg.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    logger.info("Отправлено в Telegram (медиа по одному%s).", ", дубль текста" if text and not caption_used else "")
 
 
 def main() -> None:
     load_dotenv()
+    setup_logging()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -162,6 +219,17 @@ def main() -> None:
     if not chat_id:
         raise SystemExit("Не задан TELEGRAM_CHAT_ID и не найден Settings/chat_id в Excel.")
 
+    logger.info(
+        "Старт: источник=%s, meta_sheets=%s, интервал=%s дн., время МСК=%02d:%02d, RUN_ONCE=%s, START_IMMEDIATELY=%s",
+        posts_source if len(str(posts_source)) < 80 else str(posts_source)[:77] + "…",
+        use_excel_meta,
+        interval_days,
+        post_hour,
+        post_minute,
+        run_once,
+        start_immediately,
+    )
+
     while True:
         # Время/интервал держим в state.json (чтобы не ломать Excel),
         # а очередность берём из Excel (State/Queue), если они есть.
@@ -178,6 +246,7 @@ def main() -> None:
             if post is None:
                 # В вашем файле Queue заканчивается маркером "recycle" — это означает "вернуться к началу".
                 if str(post_id).strip().casefold() == "recycle":
+                    logger.info("Queue: recycle — сброс Postindex на 1.")
                     write_state(posts_source, post_index=1, last_posted_at=_utc_now())
                     continue
                 raise SystemExit(f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts.")
@@ -189,20 +258,31 @@ def main() -> None:
         effective_last_posted_at = excel_last_posted_at if excel_last_posted_at is not None else time_state.last_posted_at
         if effective_last_posted_at is None:
             if start_immediately:
-                _send_post(tg, chat_id, post)
                 if use_excel_meta:
+                    _send_post(
+                        tg,
+                        chat_id,
+                        post,
+                        queue_step=step,
+                        queue_len=len(q),
+                        excel_post_index=s.post_index,
+                    )
                     q = read_queue_post_ids(posts_source)
                     s = read_state(posts_source)
                     next_step = (s.post_index % len(q)) + 1
                     write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+                    logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
                 else:
+                    _send_post(tg, chat_id, post)
                     # индекс в json используем только если нет Excel очереди
                     new_state = BotState(index=(time_state.index + 1) % len(posts), last_posted_at=_utc_now())
                     new_state.save(state_path)
+                    logger.info("state.json: следующий индекс поста=%s.", new_state.index)
 
                 new_time_state = BotState(index=time_state.index, last_posted_at=_utc_now())
                 new_time_state.save(state_path)
                 if run_once:
+                    logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
                     return
                 continue
             # Первый запуск: если не стартуем сразу — ждём ближайшие постовые часы в МСК.
@@ -230,24 +310,48 @@ def main() -> None:
         sleep_s = _sleep_seconds_until(next_at)
         if sleep_s > 0:
             if run_once:
+                logger.info(
+                    "Пока рано: следующий слот %s UTC (%s МСК), осталось ~%s мин. RUN_ONCE — выход.",
+                    next_at.strftime("%Y-%m-%d %H:%M:%S %z"),
+                    next_at.astimezone(_MSK_TZ).strftime("%Y-%m-%d %H:%M"),
+                    max(1, sleep_s // 60),
+                )
                 return
+            logger.debug(
+                "Ожидание: ~%s с до %s UTC",
+                min(sleep_s, 60),
+                next_at.strftime("%H:%M:%S"),
+            )
             time.sleep(min(sleep_s, 60))
             continue
 
-        _send_post(tg, chat_id, post)
+        if use_excel_meta:
+            _send_post(
+                tg,
+                chat_id,
+                post,
+                queue_step=step,
+                queue_len=len(q),
+                excel_post_index=s.post_index,
+            )
+        else:
+            _send_post(tg, chat_id, post)
 
         if use_excel_meta:
             q = read_queue_post_ids(posts_source)
             s = read_state(posts_source)
             next_step = (s.post_index % len(q)) + 1
             write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+            logger.info("State обновлён: Postindex=%s.", next_step)
         else:
             new_state = BotState(index=(time_state.index + 1) % len(posts), last_posted_at=_utc_now())
             new_state.save(state_path)
+            logger.info("state.json: следующий индекс поста=%s.", new_state.index)
 
         new_time_state = BotState(index=time_state.index, last_posted_at=_utc_now())
         new_time_state.save(state_path)
         if run_once:
+            logger.info("RUN_ONCE: цикл завершён после публикации.")
             return
 
 

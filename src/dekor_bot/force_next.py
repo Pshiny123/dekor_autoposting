@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import logging
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -16,7 +17,9 @@ from .excel_meta import (
 from .excel_posts import index_posts_by_id, load_posts
 from .state import BotState
 from .telegram_api import TelegramClient
-from .main import _send_post  # reuse send logic
+from .main import _send_post, setup_logging
+
+logger = logging.getLogger(__name__)
 
 
 def _is_google_sheets_url(source: str) -> bool:
@@ -33,6 +36,8 @@ def main() -> None:
     и обновляет Excel State + state.json так, будто время подошло сейчас.
     """
     load_dotenv()
+    setup_logging()
+    logger.info("force_next: принудительная отправка следующего поста.")
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -57,19 +62,23 @@ def main() -> None:
 
     time_state = BotState.load(state_path)
 
+    step: int | None = None
+    q_meta: list[str] = []
+    state_for_send = None
     if use_excel_meta:
-        q = read_queue_post_ids(posts_source)
-        s = read_state(posts_source)
-        step = ((s.post_index - 1) % len(q)) + 1
-        post_id = q[step - 1]
+        q_meta = read_queue_post_ids(posts_source)
+        state_for_send = read_state(posts_source)
+        step = ((state_for_send.post_index - 1) % len(q_meta)) + 1
+        post_id = q_meta[step - 1]
         post = posts_by_id.get(str(post_id))
         if post is None:
             if str(post_id).strip().casefold() == "recycle":
-                # как и в основном цикле — сбрасываем на начало и берём первый
+                logger.info("force_next: recycle — сброс Postindex на 1.")
                 write_state(posts_source, post_index=1, last_posted_at=_utc_now())
-                q = read_queue_post_ids(posts_source)
-                first_id = q[0]
+                q_meta = read_queue_post_ids(posts_source)
+                first_id = q_meta[0]
                 post = posts_by_id.get(str(first_id))
+                step = 1
             if post is None:
                 raise SystemExit(f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts.")
     else:
@@ -77,7 +86,17 @@ def main() -> None:
         post = posts[idx]
 
     # Отправляем прямо сейчас, игнорируя интервалы.
-    _send_post(tg, chat_id, post)
+    if use_excel_meta and step is not None and state_for_send is not None:
+        _send_post(
+            tg,
+            chat_id,
+            post,
+            queue_step=step,
+            queue_len=len(q_meta),
+            excel_post_index=state_for_send.post_index,
+        )
+    else:
+        _send_post(tg, chat_id, post)
 
     now = _utc_now()
 
@@ -87,13 +106,16 @@ def main() -> None:
         s = read_state(posts_source)
         next_step = (s.post_index % len(q)) + 1
         write_state(posts_source, post_index=next_step, last_posted_at=now)
+        logger.info("force_next: State обновлён — Postindex=%s, LastPostedAt записан.", next_step)
     else:
         new_state = BotState(index=(time_state.index + 1) % len(posts), last_posted_at=now)
         new_state.save(state_path)
+        logger.info("force_next: state.json — следующий индекс=%s.", new_state.index)
 
     # Обновляем таймер в state.json так, будто интервал уже наступил сейчас
     forced_state = BotState(index=time_state.index, last_posted_at=now)
     forced_state.save(state_path)
+    logger.info("force_next: готово.")
 
 
 if __name__ == "__main__":

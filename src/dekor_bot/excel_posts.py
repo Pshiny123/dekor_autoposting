@@ -12,6 +12,8 @@ try:
 except Exception:  # pragma: no cover
     gspread = None  # type: ignore[assignment]
 
+from .excel_meta import _norm_queue_post_id
+
 
 @dataclass(frozen=True)
 class Post:
@@ -135,7 +137,11 @@ def load_posts(source: str | Path, sheet_name: str) -> list[Post]:
     posts: list[Post] = []
     for _, row in df.iterrows():
         raw_id = row.get("ID", "")
-        post_id = "" if pd.isna(raw_id) else str(raw_id).strip()
+        if pd.isna(raw_id):
+            post_id = ""
+        else:
+            nid = _norm_queue_post_id(raw_id)
+            post_id = nid if nid is not None else str(raw_id).strip().lstrip("\ufeff").strip()
         raw_text = row.get("text", "")
         text = "" if pd.isna(raw_text) else str(raw_text)
 
