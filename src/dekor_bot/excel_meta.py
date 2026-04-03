@@ -57,13 +57,26 @@ def _extract_gsheet_id(url: str) -> str:
 def _get_gspread_client():
     if gspread is None:
         raise RuntimeError("Для Google Sheets установите зависимости: gspread и google-auth.")
-    inline_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "").strip()
+    raw_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
+    inline_json = raw_inline.strip().lstrip("\ufeff")
     if inline_json:
         try:
             info = json.loads(inline_json)
             return gspread.service_account_from_dict(info)
+        except json.JSONDecodeError as exc:
+            hint = (
+                "Частые причины: (1) JSON в .env разбит на несколько строк — должна быть РОВНО одна строка, "
+                "в private_key только \\n как два символа; (2) в строке есть неэкранированные кавычки; "
+                "(3) после значения на той же строке идёт # комментарий — обрежет JSON. "
+                "Надёжнее: сохраните ключ в .json файл и задайте GOOGLE_SERVICE_ACCOUNT_JSON=/полный/путь/к/ключу.json"
+            )
+            raise ValueError(
+                f"GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: ошибка JSON — {exc.msg} (позиция {exc.pos}). {hint}"
+            ) from exc
         except Exception as exc:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE содержит невалидный JSON.") from exc
+            raise ValueError(
+                "GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: не удалось разобрать ключ. Проверьте однострочный JSON или используйте файл GOOGLE_SERVICE_ACCOUNT_JSON=..."
+            ) from exc
     creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if creds_path:
         p = Path(creds_path).expanduser().resolve()

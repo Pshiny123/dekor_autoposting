@@ -44,13 +44,19 @@ def _extract_gsheet_id(url: str) -> str:
 def _get_gspread_client():
     if gspread is None:
         return None
-    inline_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "").strip()
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
+    inline_json = raw.strip().lstrip("\ufeff")
     if inline_json:
         try:
             info = json.loads(inline_json)
             return gspread.service_account_from_dict(info)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: ошибка JSON — {exc.msg} (позиция {exc.pos}). "
+                "Одна строка в .env; в private_key только \\n; не ставьте # в конце строки с JSON."
+            ) from exc
         except Exception as exc:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE содержит невалидный JSON.") from exc
+            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: невалидные данные.") from exc
     creds_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
     if creds_path:
         p = Path(creds_path).expanduser().resolve()
