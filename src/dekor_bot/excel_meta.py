@@ -95,6 +95,16 @@ def _get_gspread_client():
     raw_inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "")
     inline_json = normalize_google_service_account_json_inline(raw_inline)
     if inline_json:
+        t = inline_json.lstrip()
+        if t.startswith("{") and len(t) > 1:
+            rest = t[1:].lstrip()
+            if rest and rest[0] != '"':
+                raise ValueError(
+                    "GOOGLE_SERVICE_ACCOUNT_JSON_INLINE: это не JSON — после «{» должна идти двойная кавычка (\"type\"), "
+                    "а у вас пропали \" вокруг ключей (получилось {type:… вместо {\"type\":…). "
+                    "Часто: строка в .env обёрнута в кавычки \"...\" без экранирования внутренних \". "
+                    "Сделайте так: GOOGLE_SERVICE_ACCOUNT_JSON=/opt/dekor_autoposting/sa.json и положите туда файл ключа как скачал Google."
+                )
         try:
             info = json.loads(inline_json)
             return gspread.service_account_from_dict(info)
