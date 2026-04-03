@@ -10,24 +10,15 @@ client_email в JSON сервис-аккаунта (Google Sheets → Подел
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-from .excel_meta import (
-    _extract_gsheet_id,
-    _get_gspread_client,
-    _is_google_sheets_url,
-    _norm,
-    has_meta_sheets,
-    read_queue_post_ids,
-    read_state,
-)
-
 
 def _service_account_email() -> str | None:
+    import os
+
     inline = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON_INLINE", "").strip()
     if inline:
         try:
@@ -47,7 +38,32 @@ def _service_account_email() -> str | None:
 
 
 def main() -> int:
+    import os
+
     load_dotenv()
+
+    try:
+        import gspread  # noqa: F401
+    except ImportError:
+        print(
+            "Модуль gspread не установлен. В активированном venv выполните:\n"
+            "  pip install -r requirements.txt\n"
+            "или:\n"
+            "  pip install gspread google-auth",
+            file=sys.stderr,
+        )
+        return 1
+
+    from .excel_meta import (
+        _extract_gsheet_id,
+        _get_gspread_client,
+        _is_google_sheets_url,
+        _norm,
+        has_meta_sheets,
+        read_queue_post_ids,
+        read_state,
+    )
+
     raw = os.getenv("POSTS_XLSX_PATH", "").strip()
     if not raw:
         print("В .env не задан POSTS_XLSX_PATH.", file=sys.stderr)
@@ -61,12 +77,20 @@ def main() -> int:
     if email:
         print(f"Сервис-аккаунт (добавьте его в «Поделиться» таблицы как редактор): {email}")
     else:
-        print("Не найден client_email: задайте GOOGLE_SERVICE_ACCOUNT_JSON или GOOGLE_SERVICE_ACCOUNT_JSON_INLINE.")
+        print(
+            "В .env нет ключа Google для сервис-аккаунта.\n"
+            "  Добавьте GOOGLE_SERVICE_ACCOUNT_JSON_INLINE=... (JSON одной строкой)\n"
+            "  или GOOGLE_SERVICE_ACCOUNT_JSON=/путь/к/ключ.json\n"
+            "Скопируйте те же переменные, что на машине, где у вас уже менялся State.",
+            file=sys.stderr,
+        )
 
     try:
         client = _get_gspread_client()
     except Exception as exc:
         print(f"Ошибка учётных данных Google: {exc}", file=sys.stderr)
+        if not email:
+            print("(Сначала задайте JSON сервис-аккаунта в .env — см. выше.)", file=sys.stderr)
         return 1
 
     sid = _extract_gsheet_id(raw)
