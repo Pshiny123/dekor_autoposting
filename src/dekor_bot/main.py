@@ -57,6 +57,33 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _acquire_single_instance_lock():
+    """
+    Гарантирует единственный активный процесс бота на хосте.
+    Если lock уже занят, завершаемся без отправки (защита от дублей).
+    """
+    lock_path = (os.getenv("BOT_LOCK_FILE") or "/tmp/dekor_autoposting.lock").strip()
+    lock_file = open(lock_path, "a+", encoding="utf-8")
+    try:
+        if os.name == "nt":
+            import msvcrt  # pragma: no cover
+
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except Exception:
+        lock_file.close()
+        raise SystemExit(f"Уже запущен другой экземпляр бота (lock: {lock_path}).")
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    return lock_file
+
+
 try:
     _MSK_TZ = ZoneInfo("Europe/Moscow") if ZoneInfo is not None else timezone(timedelta(hours=3))
 except Exception:  # pragma: no cover
@@ -203,6 +230,7 @@ def _require_meta_sheets(posts_source: str, posts_source_raw: str) -> None:
 def main() -> None:
     load_dotenv()
     setup_logging()
+    _instance_lock = _acquire_single_instance_lock()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
