@@ -1,0 +1,16 @@
+services:
+  dekor-bot:
+    build: .
+    container_name: dekor-autoposting
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      GOOGLE_SERVICE_ACCOUNT_JSON: /app/sa.json
+      DATA_DIR: /app/data
+      BOT_LOCK_FILE: /app/data/dekor_autoposting.lock
+      RUN_LOG_PATH: /app/data/run_log.json
+      RUN_ONCE: "false"
+    volumes:
+      - ./sa.json:/app/sa.json:ro
+      - ./data:/app/data
