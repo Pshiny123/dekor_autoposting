@@ -279,10 +279,18 @@ def _log_run(entry: dict[str, Any]) -> None:
         logger.exception("Не удалось записать run_log.json")
 
 
-def _advance_queue(posts_source: str, queue_len: int) -> int:
+def _advance_queue_on_success(posts_source: str, queue_len: int) -> int:
     s = read_state(posts_source)
     next_step = (s.post_index % queue_len) + 1
     write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+    return next_step
+
+
+def _advance_queue_on_skip(posts_source: str, queue_len: int) -> int:
+    """Пропуск битого поста: сдвигаем очередь, LastPostedAt не трогаем — слот ещё открыт."""
+    s = read_state(posts_source)
+    next_step = (s.post_index % queue_len) + 1
+    write_state(posts_source, post_index=next_step, last_posted_at=s.last_posted_at)
     return next_step
 
 
@@ -357,7 +365,7 @@ def _handle_failed_post(
     except Exception:
         logger.exception("Не удалось уведомить админа о падении поста %s", post.post_id)
 
-    next_step = _advance_queue(posts_source, queue_len)
+    next_step = _advance_queue_on_skip(posts_source, queue_len)
     msg = f"Пост #{post.post_id} пропущен после {attempts} попыток: {short_reason}"
     if slot_msk:
         msg = f"{msg} (слот {slot_msk} МСК)."
@@ -438,6 +446,8 @@ def main() -> None:
             start_immediately,
         )
 
+        consecutive_skips = 0
+
         while True:
             q = read_queue_post_ids(posts_source)
             s = read_state(posts_source)
@@ -473,7 +483,8 @@ def main() -> None:
                         excel_post_index=s.post_index,
                     )
                     if ok:
-                        next_step = _advance_queue(posts_source, len(q))
+                        consecutive_skips = 0
+                        next_step = _advance_queue_on_success(posts_source, len(q))
                         logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
                         _log_run(
                             {
@@ -484,23 +495,33 @@ def main() -> None:
                                 "finished_at": _utc_now().isoformat(),
                             }
                         )
-                    else:
-                        assert exc is not None
-                        _handle_failed_post(
-                            tg,
-                            posts_source,
-                            sheet_name,
-                            post,
-                            queue_step=step,
-                            queue_len=len(q),
-                            exc=exc,
-                            cycle_log=cycle_log,
-                            action="immediate_first_post_failed",
-                        )
+                        cycle_logged = True
+                        if run_once:
+                            logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
+                            return
+                        continue
+                    assert exc is not None
+                    _handle_failed_post(
+                        tg,
+                        posts_source,
+                        sheet_name,
+                        post,
+                        queue_step=step,
+                        queue_len=len(q),
+                        exc=exc,
+                        cycle_log=cycle_log,
+                        action="immediate_first_post_failed",
+                    )
                     cycle_logged = True
-                    if run_once:
-                        logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
-                        return
+                    consecutive_skips += 1
+                    if consecutive_skips >= len(q):
+                        logger.error("Все посты в очереди упали подряд — останавливаем попытки.")
+                        s = read_state(posts_source)
+                        write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
+                        if run_once:
+                            return
+                        continue
+                    logger.info("Упавший пост пропущен — сразу пробуем следующий.")
                     continue
                 now_msk = _utc_now().astimezone(_MSK_TZ)
                 today_target = datetime(
@@ -573,7 +594,8 @@ def main() -> None:
                 excel_post_index=s.post_index,
             )
             if ok:
-                next_step = _advance_queue(posts_source, len(q))
+                consecutive_skips = 0
+                next_step = _advance_queue_on_success(posts_source, len(q))
                 logger.info("State обновлён: Postindex=%s.", next_step)
                 _log_run(
                     {
@@ -584,25 +606,36 @@ def main() -> None:
                         "finished_at": _utc_now().isoformat(),
                     }
                 )
-            else:
-                assert exc is not None
-                _handle_failed_post(
-                    tg,
-                    posts_source,
-                    sheet_name,
-                    post,
-                    queue_step=step,
-                    queue_len=len(q),
-                    exc=exc,
-                    cycle_log=cycle_log,
-                    action="scheduled_post_failed",
-                    slot_msk=_fmt_dt_msk(next_at),
-                )
-            cycle_logged = True
+                cycle_logged = True
+                if run_once:
+                    logger.info("RUN_ONCE: цикл завершён после публикации.")
+                    return
+                continue
 
-            if run_once:
-                logger.info("RUN_ONCE: цикл завершён после публикации.")
-                return
+            assert exc is not None
+            _handle_failed_post(
+                tg,
+                posts_source,
+                sheet_name,
+                post,
+                queue_step=step,
+                queue_len=len(q),
+                exc=exc,
+                cycle_log=cycle_log,
+                action="scheduled_post_failed",
+                slot_msk=_fmt_dt_msk(next_at),
+            )
+            cycle_logged = True
+            consecutive_skips += 1
+            if consecutive_skips >= len(q):
+                logger.error("Все посты в очереди упали подряд в этом слоте — ждём следующий интервал.")
+                s = read_state(posts_source)
+                write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
+                if run_once:
+                    return
+                continue
+            logger.info("Упавший пост пропущен — в этот же слот пробуем следующий.")
+            continue
     except SystemExit as exc:
         run_log.update(
             {
