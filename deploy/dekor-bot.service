@@ -1,0 +1,15 @@
+[Unit]
+Description=Dekor Telegram autoposting bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dekor_autoposting
+EnvironmentFile=/opt/dekor_autoposting/.env
+ExecStart=/opt/dekor_autoposting/venv/bin/python -m src.dekor_bot.main
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

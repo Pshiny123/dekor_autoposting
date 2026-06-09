@@ -386,6 +386,19 @@ def _handle_failed_post(
     return next_step
 
 
+def _cycle_error_backoff_sec() -> int:
+    try:
+        n = int(os.getenv("CYCLE_ERROR_BACKOFF_SEC", "60"))
+    except ValueError:
+        n = 60
+    return max(10, n)
+
+
+def _reload_posts(posts_source: str, sheet_name: str) -> dict[str, Post]:
+    posts = load_posts(source=posts_source, sheet_name=sheet_name)
+    return index_posts_by_id(posts)
+
+
 def main() -> None:
     load_dotenv()
     setup_logging()
@@ -412,8 +425,7 @@ def main() -> None:
         start_immediately = _env_bool("START_IMMEDIATELY", True)
         run_once = _env_bool("RUN_ONCE", False)
 
-        posts = load_posts(source=posts_source, sheet_name=sheet_name)
-        posts_by_id = index_posts_by_id(posts)
+        posts_by_id = _reload_posts(posts_source, sheet_name)
         tg = TelegramClient(token=token)
 
         _require_meta_sheets(posts_source, posts_source_raw)
@@ -449,193 +461,223 @@ def main() -> None:
         consecutive_skips = 0
 
         while True:
-            q = read_queue_post_ids(posts_source)
-            s = read_state(posts_source)
-            excel_last_posted_at = s.last_posted_at
-            step = ((s.post_index - 1) % len(q)) + 1  # 1..len(q)
-            post_id = q[step - 1]
-            post = posts_by_id.get(str(post_id))
-            if post is None:
-                if str(post_id).strip().casefold() == "recycle":
-                    logger.info("Queue: recycle — сброс Postindex на 1.")
-                    write_state(posts_source, post_index=1, last_posted_at=_utc_now())
+            try:
+                posts_by_id = _reload_posts(posts_source, sheet_name)
+                q = read_queue_post_ids(posts_source)
+                s = read_state(posts_source)
+                excel_last_posted_at = s.last_posted_at
+                step = ((s.post_index - 1) % len(q)) + 1  # 1..len(q)
+                post_id = q[step - 1]
+                post = posts_by_id.get(str(post_id))
+                if post is None:
+                    if str(post_id).strip().casefold() == "recycle":
+                        logger.info("Queue: recycle — сброс Postindex на 1.")
+                        write_state(posts_source, post_index=1, last_posted_at=_utc_now())
+                        continue
+                    msg = f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts."
+                    logger.error(msg)
+                    if run_once:
+                        raise SystemExit(msg)
+                    _advance_queue_on_skip(posts_source, len(q))
+                    time.sleep(_cycle_error_backoff_sec())
                     continue
-                raise SystemExit(f"Queue ссылается на PostID={post_id}, но такого ID нет в листе Posts.")
 
-            cycle_log: dict[str, Any] = {
-                **run_log,
-                "post_id": str(post_id),
-                "queue_step": step,
-                "queue_len": len(q),
-                "post_index": s.post_index,
-                "last_posted_at": excel_last_posted_at.isoformat() if excel_last_posted_at else None,
-            }
+                cycle_log: dict[str, Any] = {
+                    **run_log,
+                    "post_id": str(post_id),
+                    "queue_step": step,
+                    "queue_len": len(q),
+                    "post_index": s.post_index,
+                    "last_posted_at": excel_last_posted_at.isoformat() if excel_last_posted_at else None,
+                }
 
-            effective_last_posted_at = excel_last_posted_at
-            if effective_last_posted_at is None:
-                if start_immediately:
-                    ok, exc = _attempt_send_post(
-                        tg,
-                        chat_id,
-                        post,
-                        queue_step=step,
-                        queue_len=len(q),
-                        excel_post_index=s.post_index,
+                effective_last_posted_at = excel_last_posted_at
+                if effective_last_posted_at is None:
+                    if start_immediately:
+                        ok, exc = _attempt_send_post(
+                            tg,
+                            chat_id,
+                            post,
+                            queue_step=step,
+                            queue_len=len(q),
+                            excel_post_index=s.post_index,
+                        )
+                        if ok:
+                            consecutive_skips = 0
+                            next_step = _advance_queue_on_success(posts_source, len(q))
+                            logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
+                            _log_run(
+                                {
+                                    **cycle_log,
+                                    "status": "success",
+                                    "action": "immediate_first_post",
+                                    "message": "Первый пост отправлен сразу (START_IMMEDIATELY=true).",
+                                    "finished_at": _utc_now().isoformat(),
+                                }
+                            )
+                            cycle_logged = True
+                            if run_once:
+                                logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
+                                return
+                            continue
+                        assert exc is not None
+                        _handle_failed_post(
+                            tg,
+                            posts_source,
+                            sheet_name,
+                            post,
+                            queue_step=step,
+                            queue_len=len(q),
+                            exc=exc,
+                            cycle_log=cycle_log,
+                            action="immediate_first_post_failed",
+                        )
+                        cycle_logged = True
+                        consecutive_skips += 1
+                        if consecutive_skips >= len(q):
+                            logger.error("Все посты в очереди упали подряд — останавливаем попытки.")
+                            s = read_state(posts_source)
+                            write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
+                            if run_once:
+                                return
+                            continue
+                        logger.info("Упавший пост пропущен — сразу пробуем следующий.")
+                        continue
+                    now_msk = _utc_now().astimezone(_MSK_TZ)
+                    today_target = datetime(
+                        now_msk.year,
+                        now_msk.month,
+                        now_msk.day,
+                        post_hour,
+                        post_minute,
+                        tzinfo=_MSK_TZ,
                     )
-                    if ok:
-                        consecutive_skips = 0
-                        next_step = _advance_queue_on_success(posts_source, len(q))
-                        logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
+                    if now_msk < today_target:
+                        next_at = today_target.astimezone(timezone.utc)
+                    else:
+                        next_at = (today_target + timedelta(days=1)).astimezone(timezone.utc)
+                else:
+                    next_at = _next_post_at_utc_from_last(
+                        last_posted_at_utc=effective_last_posted_at,
+                        interval_days=interval_days,
+                        post_hour=post_hour,
+                        post_minute=post_minute,
+                    )
+
+                sleep_s = _sleep_seconds_until(next_at)
+                cycle_log.update(
+                    {
+                        "scheduled_slot_utc": _fmt_dt_utc(next_at),
+                        "scheduled_slot_msk": _fmt_dt_msk(next_at),
+                        "seconds_until_slot": sleep_s,
+                        "is_due": sleep_s == 0,
+                    }
+                )
+
+                if sleep_s > 0:
+                    if run_once:
+                        msg = (
+                            f"Запланировано на {_fmt_dt_msk(next_at)} МСК — пока рано, "
+                            f"осталось ~{max(1, sleep_s // 60)} мин."
+                        )
+                        logger.info(
+                            "Пока рано: следующий слот %s UTC (%s МСК), осталось ~%s мин. RUN_ONCE — выход.",
+                            next_at.strftime("%Y-%m-%d %H:%M:%S %z"),
+                            next_at.astimezone(_MSK_TZ).strftime("%Y-%m-%d %H:%M"),
+                            max(1, sleep_s // 60),
+                        )
                         _log_run(
                             {
                                 **cycle_log,
-                                "status": "success",
-                                "action": "immediate_first_post",
-                                "message": "Первый пост отправлен сразу (START_IMMEDIATELY=true).",
+                                "status": "scheduled_skip",
+                                "action": "wait_for_slot",
+                                "message": msg,
                                 "finished_at": _utc_now().isoformat(),
                             }
                         )
                         cycle_logged = True
-                        if run_once:
-                            logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
-                            return
-                        continue
-                    assert exc is not None
-                    _handle_failed_post(
-                        tg,
-                        posts_source,
-                        sheet_name,
-                        post,
-                        queue_step=step,
-                        queue_len=len(q),
-                        exc=exc,
-                        cycle_log=cycle_log,
-                        action="immediate_first_post_failed",
+                        return
+                    logger.debug(
+                        "Ожидание: ~%s с до %s UTC",
+                        min(sleep_s, 60),
+                        next_at.strftime("%H:%M:%S"),
                     )
-                    cycle_logged = True
-                    consecutive_skips += 1
-                    if consecutive_skips >= len(q):
-                        logger.error("Все посты в очереди упали подряд — останавливаем попытки.")
-                        s = read_state(posts_source)
-                        write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
-                        if run_once:
-                            return
-                        continue
-                    logger.info("Упавший пост пропущен — сразу пробуем следующий.")
+                    time.sleep(min(sleep_s, 60))
                     continue
-                now_msk = _utc_now().astimezone(_MSK_TZ)
-                today_target = datetime(
-                    now_msk.year,
-                    now_msk.month,
-                    now_msk.day,
-                    post_hour,
-                    post_minute,
-                    tzinfo=_MSK_TZ,
-                )
-                if now_msk < today_target:
-                    next_at = today_target.astimezone(timezone.utc)
-                else:
-                    next_at = (today_target + timedelta(days=1)).astimezone(timezone.utc)
-            else:
-                next_at = _next_post_at_utc_from_last(
-                    last_posted_at_utc=effective_last_posted_at,
-                    interval_days=interval_days,
-                    post_hour=post_hour,
-                    post_minute=post_minute,
-                )
 
-            sleep_s = _sleep_seconds_until(next_at)
-            cycle_log.update(
-                {
-                    "scheduled_slot_utc": _fmt_dt_utc(next_at),
-                    "scheduled_slot_msk": _fmt_dt_msk(next_at),
-                    "seconds_until_slot": sleep_s,
-                    "is_due": sleep_s == 0,
-                }
-            )
-
-            if sleep_s > 0:
-                if run_once:
-                    msg = (
-                        f"Запланировано на {_fmt_dt_msk(next_at)} МСК — пока рано, "
-                        f"осталось ~{max(1, sleep_s // 60)} мин."
-                    )
-                    logger.info(
-                        "Пока рано: следующий слот %s UTC (%s МСК), осталось ~%s мин. RUN_ONCE — выход.",
-                        next_at.strftime("%Y-%m-%d %H:%M:%S %z"),
-                        next_at.astimezone(_MSK_TZ).strftime("%Y-%m-%d %H:%M"),
-                        max(1, sleep_s // 60),
-                    )
+                ok, exc = _attempt_send_post(
+                    tg,
+                    chat_id,
+                    post,
+                    queue_step=step,
+                    queue_len=len(q),
+                    excel_post_index=s.post_index,
+                )
+                if ok:
+                    consecutive_skips = 0
+                    next_step = _advance_queue_on_success(posts_source, len(q))
+                    logger.info("State обновлён: Postindex=%s.", next_step)
                     _log_run(
                         {
                             **cycle_log,
-                            "status": "scheduled_skip",
-                            "action": "wait_for_slot",
-                            "message": msg,
+                            "status": "success",
+                            "action": "scheduled_post",
+                            "message": f"Отчёт успешно отправлен в запланированный слот {_fmt_dt_msk(next_at)} МСК.",
                             "finished_at": _utc_now().isoformat(),
                         }
                     )
                     cycle_logged = True
-                    return
-                logger.debug(
-                    "Ожидание: ~%s с до %s UTC",
-                    min(sleep_s, 60),
-                    next_at.strftime("%H:%M:%S"),
-                )
-                time.sleep(min(sleep_s, 60))
-                continue
+                    if run_once:
+                        logger.info("RUN_ONCE: цикл завершён после публикации.")
+                        return
+                    continue
 
-            ok, exc = _attempt_send_post(
-                tg,
-                chat_id,
-                post,
-                queue_step=step,
-                queue_len=len(q),
-                excel_post_index=s.post_index,
-            )
-            if ok:
-                consecutive_skips = 0
-                next_step = _advance_queue_on_success(posts_source, len(q))
-                logger.info("State обновлён: Postindex=%s.", next_step)
+                assert exc is not None
+                _handle_failed_post(
+                    tg,
+                    posts_source,
+                    sheet_name,
+                    post,
+                    queue_step=step,
+                    queue_len=len(q),
+                    exc=exc,
+                    cycle_log=cycle_log,
+                    action="scheduled_post_failed",
+                    slot_msk=_fmt_dt_msk(next_at),
+                )
+                cycle_logged = True
+                consecutive_skips += 1
+                if consecutive_skips >= len(q):
+                    logger.error("Все посты в очереди упали подряд в этом слоте — ждём следующий интервал.")
+                    s = read_state(posts_source)
+                    write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
+                    if run_once:
+                        return
+                    continue
+                logger.info("Упавший пост пропущен — в этот же слот пробуем следующий.")
+                continue
+            except SystemExit:
+                raise
+            except Exception as exc:
+                logger.exception(
+                    "Ошибка в цикле бота — ждём %s с и пробуем снова (процесс не завершаем): %s",
+                    _cycle_error_backoff_sec(),
+                    exc,
+                )
                 _log_run(
                     {
-                        **cycle_log,
-                        "status": "success",
-                        "action": "scheduled_post",
-                        "message": f"Отчёт успешно отправлен в запланированный слот {_fmt_dt_msk(next_at)} МСК.",
+                        **run_log,
+                        "status": "error",
+                        "action": "cycle_recover",
+                        "message": "Временная ошибка цикла, бот продолжит работу.",
+                        "error": str(exc),
                         "finished_at": _utc_now().isoformat(),
                     }
                 )
-                cycle_logged = True
                 if run_once:
-                    logger.info("RUN_ONCE: цикл завершён после публикации.")
-                    return
+                    raise
+                time.sleep(_cycle_error_backoff_sec())
                 continue
-
-            assert exc is not None
-            _handle_failed_post(
-                tg,
-                posts_source,
-                sheet_name,
-                post,
-                queue_step=step,
-                queue_len=len(q),
-                exc=exc,
-                cycle_log=cycle_log,
-                action="scheduled_post_failed",
-                slot_msk=_fmt_dt_msk(next_at),
-            )
-            cycle_logged = True
-            consecutive_skips += 1
-            if consecutive_skips >= len(q):
-                logger.error("Все посты в очереди упали подряд в этом слоте — ждём следующий интервал.")
-                s = read_state(posts_source)
-                write_state(posts_source, post_index=s.post_index, last_posted_at=_utc_now())
-                if run_once:
-                    return
-                continue
-            logger.info("Упавший пост пропущен — в этот же слот пробуем следующий.")
-            continue
     except SystemExit as exc:
         run_log.update(
             {
