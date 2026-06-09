@@ -17,13 +17,21 @@ except Exception:  # pragma: no cover
 
 from .excel_meta import (
     has_meta_sheets,
+    highlight_post_row_pastel_red,
     read_frequency_days,
     read_queue_post_ids,
     read_settings_chat_id,
     read_state,
+    record_failed_post_stat,
     write_state,
 )
 from .excel_posts import Post, index_posts_by_id, load_posts
+from .post_failures import (
+    explain_post_failure,
+    notify_admin_about_failed_post,
+    post_max_attempts,
+    post_retry_delay_sec,
+)
 from .run_log import append_run_log
 from .telegram_api import TelegramClient
 
@@ -271,6 +279,105 @@ def _log_run(entry: dict[str, Any]) -> None:
         logger.exception("Не удалось записать run_log.json")
 
 
+def _advance_queue(posts_source: str, queue_len: int) -> int:
+    s = read_state(posts_source)
+    next_step = (s.post_index % queue_len) + 1
+    write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+    return next_step
+
+
+def _attempt_send_post(
+    tg: TelegramClient,
+    chat_id: str,
+    post: Post,
+    *,
+    queue_step: int,
+    queue_len: int,
+    excel_post_index: int,
+) -> tuple[bool, Exception | None]:
+    attempts = post_max_attempts()
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            _send_post(
+                tg,
+                chat_id,
+                post,
+                queue_step=queue_step,
+                queue_len=queue_len,
+                excel_post_index=excel_post_index,
+            )
+            return True, None
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Пост id=%s: попытка %s/%s не удалась: %s",
+                post.post_id,
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                time.sleep(post_retry_delay_sec())
+    return False, last_exc
+
+
+def _handle_failed_post(
+    tg: TelegramClient,
+    posts_source: str,
+    posts_sheet_name: str,
+    post: Post,
+    *,
+    queue_step: int,
+    queue_len: int,
+    exc: Exception,
+    cycle_log: dict[str, Any],
+    action: str,
+    slot_msk: str | None = None,
+) -> int:
+    short_reason, advice = explain_post_failure(exc, post)
+    attempts = post_max_attempts()
+
+    try:
+        record_failed_post_stat(posts_source, post.post_id, short_reason)
+        highlight_post_row_pastel_red(posts_source, posts_sheet_name, post.post_id)
+    except Exception:
+        logger.exception("Не удалось записать статистику/подсветку для поста %s", post.post_id)
+
+    try:
+        notify_admin_about_failed_post(
+            tg,
+            post,
+            queue_step=queue_step,
+            queue_len=queue_len,
+            short_reason=short_reason,
+            advice=advice,
+            attempts=attempts,
+        )
+    except Exception:
+        logger.exception("Не удалось уведомить админа о падении поста %s", post.post_id)
+
+    next_step = _advance_queue(posts_source, queue_len)
+    msg = f"Пост #{post.post_id} пропущен после {attempts} попыток: {short_reason}"
+    if slot_msk:
+        msg = f"{msg} (слот {slot_msk} МСК)."
+    logger.error(msg)
+
+    _log_run(
+        {
+            **cycle_log,
+            "status": "skipped",
+            "action": action,
+            "message": msg,
+            "error": str(exc),
+            "failure_reason": short_reason,
+            "attempts": attempts,
+            "finished_at": _utc_now().isoformat(),
+        }
+    )
+    return next_step
+
+
 def main() -> None:
     load_dotenv()
     setup_logging()
@@ -357,19 +464,16 @@ def main() -> None:
             effective_last_posted_at = excel_last_posted_at
             if effective_last_posted_at is None:
                 if start_immediately:
-                    try:
-                        _send_post(
-                            tg,
-                            chat_id,
-                            post,
-                            queue_step=step,
-                            queue_len=len(q),
-                            excel_post_index=s.post_index,
-                        )
-                        q = read_queue_post_ids(posts_source)
-                        s = read_state(posts_source)
-                        next_step = (s.post_index % len(q)) + 1
-                        write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+                    ok, exc = _attempt_send_post(
+                        tg,
+                        chat_id,
+                        post,
+                        queue_step=step,
+                        queue_len=len(q),
+                        excel_post_index=s.post_index,
+                    )
+                    if ok:
+                        next_step = _advance_queue(posts_source, len(q))
                         logger.info("State обновлён: Postindex=%s, LastPostedAt=сейчас.", next_step)
                         _log_run(
                             {
@@ -380,20 +484,20 @@ def main() -> None:
                                 "finished_at": _utc_now().isoformat(),
                             }
                         )
-                        cycle_logged = True
-                    except Exception as exc:
-                        _log_run(
-                            {
-                                **cycle_log,
-                                "status": "error",
-                                "action": "immediate_first_post",
-                                "message": "Ошибка при первой отправке.",
-                                "error": str(exc),
-                                "finished_at": _utc_now().isoformat(),
-                            }
+                    else:
+                        assert exc is not None
+                        _handle_failed_post(
+                            tg,
+                            posts_source,
+                            sheet_name,
+                            post,
+                            queue_step=step,
+                            queue_len=len(q),
+                            exc=exc,
+                            cycle_log=cycle_log,
+                            action="immediate_first_post_failed",
                         )
-                        cycle_logged = True
-                        raise
+                    cycle_logged = True
                     if run_once:
                         logger.info("RUN_ONCE: старт с немедленной отправкой — выход.")
                         return
@@ -460,19 +564,16 @@ def main() -> None:
                 time.sleep(min(sleep_s, 60))
                 continue
 
-            try:
-                _send_post(
-                    tg,
-                    chat_id,
-                    post,
-                    queue_step=step,
-                    queue_len=len(q),
-                    excel_post_index=s.post_index,
-                )
-                q = read_queue_post_ids(posts_source)
-                s = read_state(posts_source)
-                next_step = (s.post_index % len(q)) + 1
-                write_state(posts_source, post_index=next_step, last_posted_at=_utc_now())
+            ok, exc = _attempt_send_post(
+                tg,
+                chat_id,
+                post,
+                queue_step=step,
+                queue_len=len(q),
+                excel_post_index=s.post_index,
+            )
+            if ok:
+                next_step = _advance_queue(posts_source, len(q))
                 logger.info("State обновлён: Postindex=%s.", next_step)
                 _log_run(
                     {
@@ -483,20 +584,21 @@ def main() -> None:
                         "finished_at": _utc_now().isoformat(),
                     }
                 )
-                cycle_logged = True
-            except Exception as exc:
-                _log_run(
-                    {
-                        **cycle_log,
-                        "status": "error",
-                        "action": "scheduled_post",
-                        "message": f"Не удалось отправить в слот {_fmt_dt_msk(next_at)} МСК.",
-                        "error": str(exc),
-                        "finished_at": _utc_now().isoformat(),
-                    }
+            else:
+                assert exc is not None
+                _handle_failed_post(
+                    tg,
+                    posts_source,
+                    sheet_name,
+                    post,
+                    queue_step=step,
+                    queue_len=len(q),
+                    exc=exc,
+                    cycle_log=cycle_log,
+                    action="scheduled_post_failed",
+                    slot_msk=_fmt_dt_msk(next_at),
                 )
-                cycle_logged = True
-                raise
+            cycle_logged = True
 
             if run_once:
                 logger.info("RUN_ONCE: цикл завершён после публикации.")

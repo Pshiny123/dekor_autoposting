@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import pandas as pd
 from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 try:
     import gspread
 except Exception:  # pragma: no cover
@@ -467,5 +468,119 @@ def write_state(xlsx_path: str | Path, *, post_index: int, last_posted_at: datet
 
     upsert("Postindex", str(int(post_index)))
     upsert("LastPostedAt", _dt_to_iso(last_posted_at or _utc_now()))
+    wb.save(xlsx_path)
+
+
+def _post_id_matches(cell_val: object, post_id: str) -> bool:
+    nid = _norm_queue_post_id(cell_val)
+    return nid is not None and nid == str(post_id).strip()
+
+
+def find_posts_sheet_row(source: str | Path, posts_sheet_name: str, post_id: str) -> int | None:
+    """Номер строки (1-based) в листе Posts по колонке ID."""
+    if _is_google_sheets_url(source):
+        sh = _open_gsheet(source)
+        ws = _gsheet_worksheet_by_title(sh, posts_sheet_name)
+        values = ws.get_all_values()
+        if not values:
+            return None
+        header = values[0]
+        id_col = next((i for i, h in enumerate(header) if _norm(str(h)) == "id"), None)
+        if id_col is None:
+            return None
+        for r_idx, row in enumerate(values[1:], start=2):
+            if len(row) > id_col and _post_id_matches(row[id_col], post_id):
+                return r_idx
+        return None
+
+    xlsx_path = Path(source)
+    sheet = _pick_sheet_name(xlsx_path, posts_sheet_name)
+    df = pd.read_excel(xlsx_path, sheet_name=sheet)
+    if "ID" not in df.columns:
+        return None
+    for idx, row in df.iterrows():
+        if _post_id_matches(row.get("ID"), post_id):
+            return int(idx) + 2
+    return None
+
+
+def _ensure_state_failure_headers_gs(ws) -> None:
+    rows = ws.get_all_values()
+    d1 = rows[0][3] if rows and len(rows[0]) > 3 else ""
+    e1 = rows[0][4] if rows and len(rows[0]) > 4 else ""
+    updates: list[tuple[int, int, str]] = []
+    if not str(d1).strip():
+        updates.append((1, 4, "Упавший пост"))
+    if not str(e1).strip():
+        updates.append((1, 5, "Причина"))
+    for r, c, val in updates:
+        ws.update_cell(r, c, val)
+
+
+def _next_state_failure_row_gs(ws) -> int:
+    rows = ws.get_all_values()
+    if not rows:
+        return 2
+    for r_idx in range(len(rows), 1, -1):
+        row = rows[r_idx - 1]
+        cell = row[3] if len(row) > 3 else ""
+        if str(cell).strip():
+            return r_idx + 1
+    return 2
+
+
+def record_failed_post_stat(source: str | Path, post_id: str, reason: str) -> None:
+    """Добавляет строку в State!D:E — номер поста и причина."""
+    if _is_google_sheets_url(source):
+        sh = _open_gsheet(source)
+        ws = _gsheet_worksheet_by_title(sh, "State")
+        _ensure_state_failure_headers_gs(ws)
+        row = _next_state_failure_row_gs(ws)
+        ws.update_cell(row, 4, str(post_id))
+        ws.update_cell(row, 5, reason[:500])
+        return
+
+    xlsx_path = Path(source)
+    sheet = _pick_sheet_name(xlsx_path, "State")
+    wb = load_workbook(xlsx_path)
+    ws = wb[sheet]
+    if not str(ws.cell(row=1, column=4).value or "").strip():
+        ws.cell(row=1, column=4).value = "Упавший пост"
+    if not str(ws.cell(row=1, column=5).value or "").strip():
+        ws.cell(row=1, column=5).value = "Причина"
+    row = 2
+    while str(ws.cell(row=row, column=4).value or "").strip():
+        row += 1
+    ws.cell(row=row, column=4).value = str(post_id)
+    ws.cell(row=row, column=5).value = reason[:500]
+    wb.save(xlsx_path)
+
+
+_PASTEL_RED_GS = {"red": 0.96, "green": 0.80, "blue": 0.80}
+_PASTEL_RED_XLSX = "FFCCCC"
+
+
+def highlight_post_row_pastel_red(source: str | Path, posts_sheet_name: str, post_id: str) -> None:
+    """Красит строку поста на листе Posts в пастельно-красный."""
+    row = find_posts_sheet_row(source, posts_sheet_name, post_id)
+    if row is None:
+        return
+
+    if _is_google_sheets_url(source):
+        sh = _open_gsheet(source)
+        ws = _gsheet_worksheet_by_title(sh, posts_sheet_name)
+        ws.format(
+            f"A{row}:Z{row}",
+            {"backgroundColor": _PASTEL_RED_GS},
+        )
+        return
+
+    xlsx_path = Path(source)
+    sheet = _pick_sheet_name(xlsx_path, posts_sheet_name)
+    wb = load_workbook(xlsx_path)
+    ws = wb[sheet]
+    fill = PatternFill(start_color=_PASTEL_RED_XLSX, end_color=_PASTEL_RED_XLSX, fill_type="solid")
+    for col in range(1, ws.max_column + 1):
+        ws.cell(row=row, column=col).fill = fill
     wb.save(xlsx_path)
 
