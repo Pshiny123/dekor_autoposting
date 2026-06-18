@@ -14,6 +14,7 @@ from .excel_meta import (
     write_state,
 )
 from .excel_posts import index_posts_by_id, load_posts
+from .media_sync import sync_media_if_enabled
 from .telegram_api import TelegramClient
 from .main import _require_meta_sheets, _send_post, setup_logging
 
@@ -46,6 +47,9 @@ def main() -> None:
     if not _is_google_sheets_url(posts_source):
         posts_source = str(Path(posts_source).resolve())
     sheet_name = os.getenv("POSTS_SHEET_NAME", "posts").strip()
+
+    if sync_media_if_enabled(posts_source, sheet_name):
+        logger.info("force_next: media sync обновил таблицу.")
 
     posts = load_posts(source=posts_source, sheet_name=sheet_name)
     posts_by_id = index_posts_by_id(posts)

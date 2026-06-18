@@ -33,6 +33,7 @@ from .post_failures import (
     post_retry_delay_sec,
 )
 from .run_log import append_run_log
+from .media_sync import sync_media_if_enabled
 from .telegram_api import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -430,6 +431,10 @@ def main() -> None:
 
         _require_meta_sheets(posts_source, posts_source_raw)
 
+        if sync_media_if_enabled(posts_source, sheet_name):
+            logger.info("Media sync: таблица обновлена — перечитываем посты.")
+            posts_by_id = _reload_posts(posts_source, sheet_name)
+
         freq = read_frequency_days(posts_source)
         if freq is not None:
             interval_days = int(freq)
@@ -462,6 +467,8 @@ def main() -> None:
 
         while True:
             try:
+                if sync_media_if_enabled(posts_source, sheet_name):
+                    logger.info("Media sync: таблица обновлена — перечитываем посты.")
                 posts_by_id = _reload_posts(posts_source, sheet_name)
                 q = read_queue_post_ids(posts_source)
                 s = read_state(posts_source)
