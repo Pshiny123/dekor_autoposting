@@ -9,7 +9,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     RUN_LOG_PATH=/app/data/run_log.json
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt
 
 COPY src/ src/
 

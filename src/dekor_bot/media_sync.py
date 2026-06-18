@@ -20,17 +20,20 @@ from openpyxl import load_workbook
 
 from .excel_meta import _extract_gsheet_id, _get_gspread_client, _gsheet_worksheet_by_title, _is_google_sheets_url
 from .excel_posts import _pick_sheet_name, _read_gsheet_df
+from .video_compress import compress_enabled, max_video_bytes, prepare_video_for_telegram
 from .yandex_storage import (
     bucket_name,
     delete_cell,
     delete_keys,
     download_media,
+    download_object,
     get_s3_client,
     guess_ext,
     is_http_url,
     is_yandex_url,
     list_objects,
     object_key,
+    object_size,
     upload_file,
     yandex_configured,
     yandex_public_url,
@@ -93,6 +96,49 @@ def _save_state(state: dict) -> None:
 
 def _cell_key(post_id: str, col: str) -> str:
     return f"{post_id}:{col}"
+
+
+def _is_video_col(col: str) -> bool:
+    return col.startswith("Video")
+
+
+def _prepare_local_media(local: Path, kind: str) -> tuple[Path, str]:
+    if kind == "video":
+        prepared = prepare_video_for_telegram(local)
+        ext = prepared.suffix.lstrip(".").lower() or "mp4"
+        return prepared, ext
+    return local, guess_ext("", kind, local_path=local)
+
+
+def _recompress_bucket_video_if_needed(
+    s3,
+    bucket: str,
+    post_id: str,
+    col: str,
+    ykey: str,
+) -> bool:
+    if not _is_video_col(col) or not compress_enabled():
+        return False
+    size = object_size(s3, bucket, ykey)
+    if size is None or size <= max_video_bytes():
+        return False
+
+    with tempfile.TemporaryDirectory(prefix="dekor_recompress_") as tmp:
+        src = Path(tmp) / "source.mp4"
+        download_object(s3, bucket, ykey, src)
+        prepared, ext = _prepare_local_media(src, "video")
+        new_key = object_key(post_id, col, ext)
+        if new_key != ykey:
+            delete_keys(s3, bucket, [ykey])
+        upload_file(s3, bucket, prepared, new_key)
+        logger.info(
+            "Media sync: #%s %s пересжато в бакете %.1f → %.1f МБ",
+            post_id,
+            col,
+            size / (1024 * 1024),
+            prepared.stat().st_size / (1024 * 1024),
+        )
+    return True
 
 
 def load_media_cells(source: str, sheet_name: str) -> list[MediaCell]:
@@ -253,6 +299,17 @@ def sync_media(source: str, sheet_name: str) -> bool:
             if is_yandex_url(cell.url, bucket_b):
                 ykey = yandex_url_to_key(cell.url, bucket_b)
                 if ykey:
+                    if _recompress_bucket_video_if_needed(s3, bucket_b, cell.post_id, cell.col, ykey):
+                        ykey = object_key(cell.post_id, cell.col, "mp4")
+                        cell_url = yandex_public_url(ykey, bucket_b)
+                        state_cells[key] = {
+                            "source_url": cell.url,
+                            "yandex_key": ykey,
+                            "yandex_url": cell_url,
+                        }
+                        if cell.url != cell_url:
+                            sheet_updates.append((cell.post_id, cell.col, cell_url))
+                        continue
                     state_cells[key] = {
                         "source_url": cell.url,
                         "yandex_key": ykey,
@@ -284,18 +341,15 @@ def sync_media(source: str, sheet_name: str) -> bool:
                 local = Path(tmp) / f"{cell.post_id}_{cell.col}.{ext}"
                 logger.info("Media sync: скачивание #%s %s …", cell.post_id, cell.col)
                 download_media(cell.url, local)
-                size_mb = local.stat().st_size / (1024 * 1024)
+                if cell.kind == "video":
+                    local, ext = _prepare_local_media(local, cell.kind)
+                else:
+                    ext = guess_ext(cell.url, cell.kind, local_path=local)
                 ykey = object_key(cell.post_id, cell.col, ext)
                 upload_file(s3, bucket, local, ykey)
                 public = yandex_public_url(ykey, bucket)
+                size_mb = local.stat().st_size / (1024 * 1024)
                 logger.info("Media sync: залито %.1f МБ → %s", size_mb, public)
-                if size_mb > 50 and cell.kind == "video":
-                    logger.warning(
-                        "Media sync: #%s %s — %.1f МБ > 50 МБ, Telegram-бот может не отправить.",
-                        cell.post_id,
-                        cell.col,
-                        size_mb,
-                    )
 
             sheet_updates.append((cell.post_id, cell.col, public))
             state_cells[key] = {

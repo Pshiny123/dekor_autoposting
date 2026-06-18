@@ -144,6 +144,19 @@ def upload_file(s3, bucket: str, local_path: Path, key: str) -> None:
     )
 
 
+def object_size(s3, bucket: str, key: str) -> int | None:
+    try:
+        head = s3.head_object(Bucket=bucket, Key=key)
+        return int(head["ContentLength"])
+    except Exception:
+        return None
+
+
+def download_object(s3, bucket: str, key: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    s3.download_file(bucket, key, str(dest))
+
+
 def download_google_drive(file_id: str, dest: Path) -> None:
     session = requests.Session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
